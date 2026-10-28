@@ -24,6 +24,17 @@ pelo broker depois que a requisição desistiu de esperar, eventos publicados po
 retentativa e eventos declarados perdidos; a diferença entre a perda medida pelo oráculo e os
 declarados perdidos é a perda que nenhum contador registrou. No Software B, reinícios
 automáticos da tarefa do Debezium e se o vigia desistiu.
+
+Seções extras, conforme o cenário gravado em marcos.json:
+- Cenário 2 (promoção de réplica): transações confirmadas ao cliente que a réplica promovida
+  não tem, eventos órfãos (dessas transações, as que chegaram ao destino) e divergência de
+  conteúdo. As transações perdidas na promoção saem do oráculo geral, porque a origem não as
+  tem mais; elas são contadas à parte.
+- Cenário 3 (reinícios repetidos): ciclos de morte e religamento e as operações sem resposta
+  (o serviço morreu no meio), resolvidas pela existência da transação na origem com o mesmo
+  correlation_id.
+- Cenário 5 (queda de consumidor): rebalanceamentos e tempo fora do estado Stable, lidos de
+  grupo.csv, e expulsões por max.poll.interval.
 """
 
 from __future__ import annotations
@@ -109,6 +120,28 @@ def analisar(pasta: Path) -> dict:
                 commitadas[r["correlation_id"]] = r
             else:
                 ambiguas += 1
+
+    extras: dict = {}
+    if m.get("cenario") == 2:
+        perdidas_promocao, extras["promocao"] = _promocao(pasta, m, ledger, msgs, trans_o, contas_o, contas_d, serie)
+        for corr in perdidas_promocao:
+            commitadas.pop(corr, None)
+    if m.get("cenario") == 3:
+        sem_resposta = [r for r in ledger if r["http_status"] in ("", "0")]
+        resolvidas = sum(1 for r in sem_resposta if r["correlation_id"] in corr_na_origem)
+        extras["ambiguas"] = {"sem_resposta": len(sem_resposta), "commitadas": resolvidas,
+                              "nao_commitadas": len(sem_resposta) - resolvidas}
+        ciclos = _ler(pasta / "ciclos.csv")
+        prontos = [float(c["tempo_ate_pronto_s"]) for c in ciclos if c["tempo_ate_pronto_s"]]
+        extras["reinicios"] = {
+            "componente": m.get("parametros", {}).get("componente"),
+            "ciclos": len(ciclos),
+            "ciclos_sem_voltar": len(ciclos) - len(prontos),
+            "tempo_ate_pronto_medio_s": round(statistics.mean(prontos), 2) if prontos else None,
+            "tempo_fora_total_s": round(sum(prontos), 1),
+        }
+    if m.get("cenario") == 5:
+        extras["grupo"] = _grupo(pasta, m, serie)
 
     # No Domain Events a mensagem tem uma linha de transação e as linhas das contas; no CDC
     # cada linha é uma mensagem. "principal" marca uma linha por mensagem.
@@ -236,6 +269,7 @@ def analisar(pasta: Path) -> dict:
         },
         "tempos": tempos,
         "efeito_colateral": colateral,
+        **extras,
     }
     resumo["recuperacao"] = _recuperacao(m, serie, resumo["integridade"]["perda_eventos"])
     (pasta / "resumo.json").write_text(json.dumps(resumo, indent=2, ensure_ascii=False))
@@ -279,6 +313,88 @@ def _recuperacao(m: dict, serie: list[dict], perda_eventos: int) -> dict:
     }
 
 
+def _lsn(v: str | None) -> int | None:
+    if not v:
+        return None
+    a, _, b = v.partition("/")
+    return (int(a, 16) << 32) + int(b, 16)
+
+
+def _promocao(pasta: Path, m: dict, ledger: list[dict], msgs: list[dict], trans_o: dict, contas_o: dict,
+              contas_d: dict, serie: list[dict]) -> tuple[dict[str, dict], dict]:
+    """Cenário 2: o que a promoção da réplica apagou e o que disso chegou ao destino."""
+    retrato = {r["transaction_id"] for r in _ler(pasta / "origem_pos_promocao_transacoes.csv")}
+    # Antes de a réplica assumir o endereço, nenhuma escrita chega a ela: toda resposta 2xx
+    # recebida até ali veio de um commit no primário antigo. Respostas posteriores podem ser de
+    # requisições que esperaram a conexão e commitaram já no novo primário.
+    troca = m.get("endereco_trocado") or m.get("falha_fim") or float("inf")
+    perdidas = {r["correlation_id"]: r for r in ledger
+                if _ok(r) and float(r["t_resposta"]) <= troca and r["transaction_id"] not in retrato}
+    recebidas = {x["correlation_id"] for x in msgs if x["correlation_id"]}
+    orfaos = [c for c in perdidas if c in recebidas]
+
+    so_destino = sum(1 for r in _ler(pasta / "destino_transacoes.csv") if r["transaction_id"] not in trans_o)
+    adiantadas = sum(1 for k, d in contas_d.items() if k in contas_o and int(d["version"]) > int(contas_o[k]["version"]))
+    conflito = sum(1 for k, d in contas_d.items() if k in contas_o and d["version"] == contas_o[k]["version"]
+                   and (d["balance"], d["last_correlation_id"]) != (contas_o[k]["balance"], contas_o[k]["last_correlation_id"]))
+
+    queda = m.get("primario_derrubado") or float("inf")
+    ref = m.get("promocao_concluida") or queda
+    ausente = recriado = None
+    for x in serie:
+        t = float(x["t"])
+        if t < queda or x.get("origem_disponivel") != "1":
+            continue
+        tem_slot = x.get("slot_ativo") not in ("", None)
+        if ausente is None and not tem_slot:
+            ausente = round(t - ref, 2)
+        elif ausente is not None and tem_slot and recriado is None:
+            recriado = round(t - ref, 2)
+    antes, depois = _lsn(m.get("lsn_primario_na_queda")), _lsn(m.get("lsn_replica_na_promocao"))
+    return perdidas, {
+        "transacoes_perdidas_na_promocao": len(perdidas),
+        "eventos_orfaos": len(orfaos),
+        "wal_nao_replicado_bytes": antes - depois if antes is not None and depois is not None else None,
+        "conteudo_final": {
+            "transacoes_so_no_destino": so_destino,
+            "contas_com_versao_maior_no_destino": adiantadas,
+            "contas_mesma_versao_conteudo_diferente": conflito,
+        },
+        "slot_ausente_apos_promocao_s": ausente if m["modo"] == "cdc" else None,
+        "slot_recriado_apos_promocao_s": recriado if m["modo"] == "cdc" else None,
+    }
+
+
+def _grupo(pasta: Path, m: dict, serie: list[dict]) -> dict:
+    """Cenário 5: rebalanceamentos e tempo fora do estado Stable por fase, a partir de grupo.csv."""
+    linhas = [r for r in _ler(pasta / "grupo.csv") if r["estado"]]
+    fases = ("regime", "falha", "recuperacao", "estabilizacao")
+    fim_carga = m.get("carga_fim") or float("inf")
+
+    def fase(t: float) -> str:
+        return _fase(t, m) if t < fim_carga else "estabilizacao"
+
+    reb, nao_estavel = Counter(), Counter()
+    for a, b in zip(linhas, linhas[1:]):
+        t = float(a["t"])
+        if a["estado"] != "Stable":
+            nao_estavel[fase(t)] += float(b["t"]) - t
+        if a["estado"] == "Stable" and b["estado"] != "Stable":
+            reb[fase(float(b["t"]))] += 1
+
+    def delta(campo: str, f: str) -> int | None:
+        vals = [float(s[campo]) for s in serie if s.get(campo) not in ("", None) and s["fase"] == f]
+        return int(max(vals) - min(vals)) if vals else None
+
+    return {
+        "rebalanceamentos": {f: reb[f] for f in fases},
+        "tempo_nao_estavel_s": {f: round(nao_estavel[f], 1) for f in fases},
+        "membros_min": min((int(r["membros"]) for r in linhas), default=None),
+        "membros_max": max((int(r["membros"]) for r in linhas), default=None),
+        "expulsoes_max_poll": {f: delta("consumidor_expulsoes", f) for f in fases},
+    }
+
+
 def imprimir(r: dict) -> None:
     i = r["integridade"]
     print(f"\n=== {r['execucao']} ({r['modo']}) — falha de {r['duracao_falha_s']} s ===")
@@ -293,6 +409,9 @@ def imprimir(r: dict) -> None:
     print(f"  tempos={r['tempos']}")
     print(f"  efeito colateral={r['efeito_colateral']}")
     print(f"  recuperacao={r['recuperacao']}")
+    for chave in ("ambiguas", "reinicios", "promocao", "grupo"):
+        if chave in r:
+            print(f"  {chave}={r[chave]}")
 
 
 if __name__ == "__main__":
