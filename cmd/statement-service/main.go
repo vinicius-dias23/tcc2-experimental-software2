@@ -185,6 +185,9 @@ func (c *consumer) run(ctx context.Context, r *kafka.Reader) {
 		}
 		c.consumed.Add(1)
 		c.handle(ctx, msg)
+		if ctx.Err() != nil {
+			return // encerrando: handle pode ter desistido sem gravar, então o offset não é registrado
+		}
 		// Commit assíncrono (CommitInterval): entrega pelo menos uma vez.
 		if err := r.CommitMessages(ctx, msg); err != nil && ctx.Err() == nil {
 			log.Printf("erro registrando offset: %v", err)
@@ -232,6 +235,9 @@ func (c *consumer) runBatches(ctx context.Context, id int, newReader func() *kaf
 			c.handle(ctx, m)
 		}
 		timer.Stop()
+		if ctx.Err() != nil {
+			return // encerrando no meio do lote: nada dele é confirmado
+		}
 		ms := time.Since(start).Milliseconds()
 		c.batches.Add(1)
 		c.batchMsSum.Add(ms)
