@@ -101,6 +101,17 @@ services:
     volumes:
       - ./db/destino:/docker-entrypoint-initdb.d:ro
 
+  # Réplica física assíncrona da origem (Cenário 2). Só sobe quando pedida pelo nome
+  # (o Cenário 2 e o painel fazem isso); nos outros cenários não existe.
+  postgres-origem-replica:
+    <<: *postgres
+    ports: ["5434:5432"]
+    entrypoint: ["/bin/bash", "/replica/iniciar-replica.sh"]
+    volumes:
+      - ./db/replica:/replica:ro
+    depends_on:
+      postgres-origem: { condition: service_healthy }
+
   kafka-1:
     <<: *kafka
     environment:
@@ -169,9 +180,25 @@ services:
   statement-service-domain-events:
     <<: *statement-service
     profiles: ["domain-events"]
-    environment:
+    environment: &statement-env-a
       PROPAGATION_MODE: domain-events
       CONSUMER_WORKERS: ${CONSUMER_WORKERS:-3}
+      # Leitura em lotes com max.poll.interval (Cenário 5). 0 desliga: uma mensagem por vez.
+      CONSUMER_MAX_POLL_INTERVAL: ${CONSUMER_MAX_POLL_INTERVAL:-0}
+      CONSUMER_MAX_POLL_RECORDS: ${CONSUMER_MAX_POLL_RECORDS:-500}
+
+  # Instâncias consumidoras extras do mesmo grupo (Cenário 5). Só sobem quando pedidas pelo nome.
+  statement-service-domain-events-2:
+    <<: *statement-service
+    profiles: ["domain-events"]
+    ports: ["8084:8081"]
+    environment: *statement-env-a
+
+  statement-service-domain-events-3:
+    <<: *statement-service
+    profiles: ["domain-events"]
+    ports: ["8085:8081"]
+    environment: *statement-env-a
 
   backend-domain-events:
     image: alpine:3.20
@@ -251,9 +278,25 @@ services:
   statement-service-cdc:
     <<: *statement-service
     profiles: ["cdc"]
-    environment:
+    environment: &statement-env-b
       PROPAGATION_MODE: cdc
       CONSUMER_WORKERS: ${CONSUMER_WORKERS:-3}
+      # Leitura em lotes com max.poll.interval (Cenário 5). 0 desliga: uma mensagem por vez.
+      CONSUMER_MAX_POLL_INTERVAL: ${CONSUMER_MAX_POLL_INTERVAL:-0}
+      CONSUMER_MAX_POLL_RECORDS: ${CONSUMER_MAX_POLL_RECORDS:-500}
+
+  # Instâncias consumidoras extras do mesmo grupo (Cenário 5). Só sobem quando pedidas pelo nome.
+  statement-service-cdc-2:
+    <<: *statement-service
+    profiles: ["cdc"]
+    ports: ["8084:8081"]
+    environment: *statement-env-b
+
+  statement-service-cdc-3:
+    <<: *statement-service
+    profiles: ["cdc"]
+    ports: ["8085:8081"]
+    environment: *statement-env-b
 
   backend-change-data-capture:
     image: alpine:3.20
